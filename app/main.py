@@ -7,13 +7,12 @@ import logging
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import Body, FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -22,19 +21,27 @@ from . import __version__
 from .bundle import build_bundle, decode_bundle_base64, verify_bundle
 from .database import (
     DEFAULT_DB_PATH,
+    cancel_item as db_cancel_item,
+    cancel_queued_items as db_cancel_queued_items,
     connect,
     count_audits,
+    create_job as db_create_job,
     get_audit,
+    get_job,
     init_db,
     insert_audit,
     iter_audits,
     list_audits,
+    list_job_items,
     load_registry,
     package_count,
     upsert_package,
 )
 from .impact import build_impact
+from .jobs import JobRunner
 from .models import (
+    AuditJobCreatedResponse,
+    AuditJobResponse,
     AuditResponse,
     AuditSummary,
     BatchAuditError,
@@ -47,8 +54,18 @@ from .models import (
     BundleVerifyResponse,
     HealthResponse,
     ImpactResponse,
+    JobCancelledResponse,
     ManifestIn,
     PackageIn,
+)
+from .processing import (
+    RootPluginNotFound as _RootPluginNotFound,
+)
+from .processing import (
+    build_audit_body as _build_audit_body,
+)
+from .processing import (
+    solve_manifest as _solve_manifest,
 )
 from .semver import Version, VersionError
 from .solver import Solver
@@ -58,6 +75,7 @@ logger = logging.getLogger(__name__)
 SEED_PATH = os.environ.get("AUDIT_SEED_PATH", "/app/data/seed_registry.json")
 MAX_LIMIT = 100
 BATCH_MAX_ITEMS = 20
+JOB_MAX_ITEMS = 20
 
 
 @asynccontextmanager
@@ -71,12 +89,22 @@ async def lifespan(_app: FastAPI):
             seed = json.loads(seed_file.read_text(encoding="utf-8"))
             for name, payload in seed.items():
                 upsert_package(conn, name, payload["versions"])
+    # 恢复上次进程遗留的未完成作业（running 项标记为 failed，其余排队续跑）
+    from .database import recover_interrupted_jobs
+
+    recovered = recover_interrupted_jobs(conn)
+    if recovered:
+        logger.warning("重启恢复：%d 个运行中作业项被标记为 failed", recovered)
     conn.close()
     # 常驻连接（WAL 模式，FastAPI 同步路由）
     app.state.conn = connect(DEFAULT_DB_PATH)
+    # 后台顺序作业执行器（独立连接、守护线程）
+    app.state.job_runner = JobRunner(DEFAULT_DB_PATH)
+    app.state.job_runner.start()
     try:
         yield
     finally:
+        app.state.job_runner.stop()
         app.state.conn.close()
 
 
@@ -115,6 +143,10 @@ def index() -> dict:
             "GET /api/v1/audits/impact/{package_name}",
             "POST /api/v1/audits/export-bundle",
             "POST /api/v1/audits/verify-bundle",
+            "POST /api/v1/audit-jobs",
+            "GET /api/v1/audit-jobs/{job_id}",
+            "DELETE /api/v1/audit-jobs/{job_id}",
+            "DELETE /api/v1/audit-jobs/{job_id}/items/{item_index}",
             "PUT /api/v1/registry/packages/{name}",
             "GET /api/v1/registry/packages",
         ],
@@ -136,67 +168,6 @@ def health(request: Request) -> HealthResponse:
         database="ok" if db_ok else "error",
         packages=packages,
     )
-
-
-class _RootPluginNotFound(Exception):
-    """根插件版本不存在于注册表（单条接口映射为 422，批量接口映射为单项错误）。"""
-
-
-def _root_label(manifest: ManifestIn) -> Optional[str]:
-    if not manifest.plugin_name:
-        return None
-    if manifest.plugin_version:
-        return f"{manifest.plugin_name}@{manifest.plugin_version}"
-    return manifest.plugin_name
-
-
-def _solve_manifest(
-    manifest: ManifestIn, registry: dict
-) -> tuple[Any, Optional[str], Optional[str]]:
-    """校验清单并运行求解器，返回 (result, root_label, root_version)。
-
-    仅做内存中的校验与求解，不触碰数据库。
-    """
-    manifest.validate_root_consistency()
-
-    # 根插件版本必须存在于注册表（若声明了根插件）
-    if (
-        manifest.plugin_name is not None
-        and manifest.plugin_version not in registry.get(manifest.plugin_name, {})
-    ):
-        raise _RootPluginNotFound(
-            f"根插件 {manifest.plugin_name}@{manifest.plugin_version} 不存在于注册表；"
-            f"可用版本：{sorted(registry.get(manifest.plugin_name, {}), reverse=True)}"
-        )
-
-    solver = Solver(registry)
-    result = solver.solve(
-        root_dependencies=[(d.name, d.range) for d in manifest.dependencies],
-        root_name=manifest.plugin_name,
-        root_version=manifest.plugin_version,
-    )
-    return result, _root_label(manifest), manifest.plugin_version
-
-
-def _build_audit_body(
-    manifest: ManifestIn, result: Any, root_label: Optional[str], root_version: Optional[str]
-) -> tuple[str, str, dict]:
-    """组装待持久化/返回的审计体，返回 (audit_id, created_at, body)。"""
-    audit_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc).isoformat()
-    body = {
-        "id": audit_id,
-        "created_at": created_at,
-        "status": result.status,
-        "root_plugin": root_label,
-        "root_version": root_version,
-        "explanation": result.explanation,
-        "node_count": result.node_count,
-        "resolution": result.resolution,
-        "sources": result.sources,
-        "conflicts": result.conflicts,
-    }
-    return audit_id, created_at, body
 
 
 def _persist_audit(
@@ -343,6 +314,181 @@ def create_audits_batch(payload: BatchAuditIn, request: Request) -> BatchAuditRe
         inconclusive=counts["inconclusive"],
         error=counts["error"],
         items=items,
+    )
+
+
+# ---------- 异步审计作业 ----------
+
+
+def _normalize_job_manifests(payload: Any) -> list[Any]:
+    """作业请求体支持三种形态：单条清单对象、清单数组、{"manifests": [...]}。
+
+    仅做结构层面的整体校验（非对象、数量越界等返回 422）；
+    单项清单内容是否合法延迟到后台逐项校验，失败只挂在该项上。
+    """
+    if isinstance(payload, dict) and "manifests" in payload:
+        raw_manifests = payload["manifests"]
+    elif isinstance(payload, list):
+        raw_manifests = payload
+    elif isinstance(payload, dict):
+        # 单个清单对象（没有 manifests 包装）
+        raw_manifests = [payload]
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="请求体必须是清单对象、清单数组或 {\"manifests\": [...]}",
+        )
+
+    if not isinstance(raw_manifests, list) or not raw_manifests:
+        raise HTTPException(status_code=422, detail="manifests 必须是非空数组")
+    if len(raw_manifests) > JOB_MAX_ITEMS:
+        raise HTTPException(
+            status_code=422, detail=f"单个作业最多包含 {JOB_MAX_ITEMS} 个清单"
+        )
+    for index, raw in enumerate(raw_manifests):
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=422,
+                detail=f"manifests[{index}] 必须是清单对象",
+            )
+    return raw_manifests
+
+
+def _build_job_response(conn: sqlite3.Connection, job_id: str):
+    job = get_job(conn, job_id)
+    if job is None:
+        return None
+    rows = list_job_items(conn, job_id)
+    items = [JobRunner.build_item_out(row) for row in rows]
+    queued_n = sum(1 for row in rows if row["status"] == "queued")
+    running_n = sum(1 for row in rows if row["status"] == "running")
+    return AuditJobResponse(
+        id=job["id"],
+        status=job["status"],
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+        total=job["total"],
+        completed=job["completed"],
+        succeeded=job["succeeded"],
+        failed=job["failed"],
+        cancelled=job["cancelled"],
+        queued=queued_n,
+        running=running_n,
+        items=items,
+    )
+
+
+@app.post(
+    "/api/v1/audit-jobs",
+    response_model=AuditJobCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["audit-jobs"],
+    summary="异步审计作业：提交单条或 1～20 条清单，立即返回 job_id，后台按序求解落库",
+)
+def create_audit_job(
+    request: Request,
+    payload: Any = Body(..., media_type="application/json"),
+) -> AuditJobCreatedResponse:
+    """接收单条清单或批量清单，立即返回 ``job_id``（HTTP 202）。
+
+    后台单工作线程按提交顺序、作业内顺序逐项求解并独立事务持久化：
+    单项清单非法 / 根插件不存在 / 求解异常 / 落库异常都只记为该项 failed，
+    不阻断其他项。可用 ``GET /api/v1/audit-jobs/{job_id}`` 轮询状态与逐项结果。
+    """
+    raw_manifests = _normalize_job_manifests(payload)
+    job_id = str(uuid.uuid4())
+    conn = get_conn(request)
+    db_create_job(conn, job_id, raw_manifests)
+    request.app.state.job_runner.notify()
+
+    body = _build_job_response(conn, job_id)
+    assert body is not None
+    return AuditJobCreatedResponse(
+        id=body.id, status=body.status, total=body.total, items=body.items
+    )
+
+
+@app.get(
+    "/api/v1/audit-jobs/{job_id}",
+    response_model=AuditJobResponse,
+    tags=["audit-jobs"],
+    summary="查询作业状态、完成计数与逐项结果",
+)
+def get_audit_job(job_id: str, request: Request) -> AuditJobResponse:
+    conn = get_conn(request)
+    body = _build_job_response(conn, job_id)
+    if body is None:
+        raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
+    return body
+
+
+@app.delete(
+    "/api/v1/audit-jobs/{job_id}",
+    response_model=JobCancelledResponse,
+    tags=["audit-jobs"],
+    summary="取消作业内全部尚未开始（queued）的项",
+)
+def cancel_audit_job(job_id: str, request: Request) -> JobCancelledResponse:
+    """取消该作业中所有 queued 项；running/已终结项不受影响。
+
+    全部项被取消（且无 running/succeeded/failed）时作业以 ``succeeded`` 终结；
+    已无 queued 项时返回 ``409``（无可取消内容），作业不存在返回 ``404``。
+    """
+    conn = get_conn(request)
+    cancelled_count = db_cancel_queued_items(conn, job_id)
+    if cancelled_count is None:
+        raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
+    if cancelled_count == 0:
+        raise HTTPException(status_code=409, detail="作业中没有可取消的排队项")
+    body = _build_job_response(conn, job_id)
+    assert body is not None
+    return JobCancelledResponse(
+        id=body.id,
+        status=body.status,
+        cancelled=cancelled_count,
+        completed=body.completed,
+        succeeded=body.succeeded,
+        failed=body.failed,
+        items=body.items,
+    )
+
+
+@app.delete(
+    "/api/v1/audit-jobs/{job_id}/items/{item_index}",
+    response_model=JobCancelledResponse,
+    tags=["audit-jobs"],
+    summary="取消作业中某个尚未开始（queued）的项",
+)
+def cancel_audit_job_item(
+    job_id: str, item_index: int, request: Request
+) -> JobCancelledResponse:
+    """取消单个 queued 项（按提交下标）。
+
+    作业不存在 -> ``404``；下标越界 -> ``404``；
+    该项已开始/已终结（running/succeeded/failed/cancelled）-> ``409``。
+    """
+    conn = get_conn(request)
+    result = db_cancel_item(conn, job_id, item_index)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail=f"作业不存在: {job_id}")
+    if result == "item_not_found":
+        raise HTTPException(
+            status_code=404, detail=f"作业 {job_id} 中不存在下标 {item_index} 的项"
+        )
+    if result == "not_cancellable":
+        raise HTTPException(
+            status_code=409, detail=f"第 {item_index} 项已开始或已终结，无法取消"
+        )
+    body = _build_job_response(conn, job_id)
+    assert body is not None
+    return JobCancelledResponse(
+        id=body.id,
+        status=body.status,
+        cancelled=1,
+        completed=body.completed,
+        succeeded=body.succeeded,
+        failed=body.failed,
+        items=body.items,
     )
 
 

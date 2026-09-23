@@ -213,6 +213,83 @@ class BatchAuditResponse(BaseModel):
     )
 
 
+# ---------- 异步审计作业 ----------
+
+
+JobStatus = Literal["queued", "running", "succeeded", "failed"]
+JobItemStatus = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+
+
+class JobItemError(BaseModel):
+    """作业单项失败时的结构化错误。"""
+
+    code: Literal["invalid_manifest", "solver_error", "internal_error", "interrupted"] = (
+        Field(..., description="invalid_manifest=清单非法；solver_error=求解异常；"
+                               "internal_error=持久化等服务端异常；interrupted=重启中断")
+    )
+    message: str
+    details: Optional[List[Dict[str, Any]]] = Field(
+        None, description="结构化校验细节（Pydantic 错误列表），仅 invalid_manifest 可能携带"
+    )
+
+
+class JobItemOut(BaseModel):
+    """作业中的单项视图。"""
+
+    index: int = Field(..., description="该项在提交清单中的下标（0 起）")
+    status: JobItemStatus
+    audit_id: Optional[str] = Field(None, description="成功落库的审计记录 ID")
+    audit: Optional[AuditResponse] = Field(
+        None, description="完整审计结果（成功时与 GET /api/v1/audits/{id} 同构）"
+    )
+    error: Optional[JobItemError] = Field(None, description="结构化错误；未失败时为 null")
+    manifest: Dict[str, Any] = Field(..., description="提交时的原始清单")
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class AuditJobResponse(BaseModel):
+    """异步作业状态与逐项结果。"""
+
+    id: str
+    status: JobStatus = Field(
+        ..., description="queued=尚未开始；running=处理中；succeeded=全部完成且无失败；failed=至少一项失败"
+    )
+    created_at: str
+    updated_at: str
+    total: int = Field(..., description="提交的清单总数")
+    completed: int = Field(..., description="已终结项数（succeeded+failed+cancelled）")
+    succeeded: int
+    failed: int
+    cancelled: int = Field(..., description="经 DELETE 取消的尚未开始项数")
+    queued: int = Field(..., description="排队中（尚未开始、未取消）的项数")
+    running: int = Field(..., description="正在求解的项数")
+    items: List[JobItemOut] = Field(..., description="逐项状态与结果，顺序与提交一致")
+
+
+class AuditJobCreatedResponse(BaseModel):
+    """POST /api/v1/audit-jobs 的即时响应。"""
+
+    id: str = Field(..., description="作业 ID（job_id）")
+    status: JobStatus
+    total: int
+    items: List[JobItemOut] = Field(
+        ..., description="提交后全部为 queued 状态的逐项视图"
+    )
+
+
+class JobCancelledResponse(BaseModel):
+    """DELETE 取消操作的响应。"""
+
+    id: str
+    status: JobStatus
+    cancelled: int = Field(..., description="本次新取消的项数")
+    completed: int
+    succeeded: int
+    failed: int
+    items: List[JobItemOut]
+
+
 # ---------- 历史影响反查 ----------
 
 

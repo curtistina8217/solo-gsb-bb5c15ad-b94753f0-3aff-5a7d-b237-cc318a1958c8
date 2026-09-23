@@ -15,10 +15,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY data ./data
 COPY README.md ./README.md
+COPY entrypoint.sh ./entrypoint.sh
 
 RUN mkdir -p /data && \
     addgroup --system app && adduser --system --ingroup app app && \
-    chown -R app:app /data /app
+    chown -R app:app /data /app && \
+    chmod +x /app/entrypoint.sh
 USER app
 
 VOLUME ["/data"]
@@ -28,4 +30,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if json.load(r)['status']=='ok' else 1)"
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/app/entrypoint.sh"]
