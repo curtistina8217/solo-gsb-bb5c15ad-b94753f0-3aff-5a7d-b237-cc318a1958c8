@@ -6,7 +6,8 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 DEFAULT_DB_PATH = os.environ.get("AUDIT_DB_PATH", os.path.join(os.getcwd(), "data", "audits.db"))
 
@@ -35,8 +36,40 @@ CREATE TABLE IF NOT EXISTS package_versions (
     FOREIGN KEY (package) REFERENCES packages(name) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS audit_jobs (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    total INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+);
+
+CREATE TABLE IF NOT EXISTS audit_job_items (
+    job_id TEXT NOT NULL,
+    item_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    manifest_json TEXT NOT NULL,
+    audit_id TEXT,
+    result_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    error_details_json TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    run_token TEXT,
+    PRIMARY KEY (job_id, item_index),
+    FOREIGN KEY (job_id) REFERENCES audit_jobs(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_audits_created_at ON audits(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_job_items_status ON audit_job_items(job_id, item_index, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON audit_jobs(status, created_at);
 """
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -44,10 +77,11 @@ def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -189,3 +223,217 @@ def iter_audits(conn: sqlite3.Connection, status: Optional[str] = None) -> Itera
         )
     else:
         yield from conn.execute("SELECT * FROM audits ORDER BY created_at DESC, id")
+
+
+# ---------- 异步审计作业 ----------
+
+
+def insert_audit_job(
+    conn: sqlite3.Connection, job_id: str, created_at: str, manifests: List[Any]
+) -> None:
+    """创建作业及其全部条目（单事务），条目初始均为 queued。"""
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO audit_jobs(id, created_at, total, status) VALUES (?, ?, ?, 'queued')",
+            (job_id, created_at, len(manifests)),
+        )
+        conn.executemany(
+            """
+            INSERT INTO audit_job_items(job_id, item_index, status, manifest_json)
+            VALUES (?, ?, 'queued', ?)
+            """,
+            [
+                (job_id, index, json.dumps(manifest, ensure_ascii=False))
+                for index, manifest in enumerate(manifests)
+            ],
+        )
+
+
+def get_audit_job(conn: sqlite3.Connection, job_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM audit_jobs WHERE id = ?", (job_id,)).fetchone()
+
+
+def list_audit_job_items(conn: sqlite3.Connection, job_id: str) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM audit_job_items WHERE job_id = ? ORDER BY item_index",
+        (job_id,),
+    ).fetchall()
+
+
+def get_audit_job_item(
+    conn: sqlite3.Connection, job_id: str, item_index: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM audit_job_items WHERE job_id = ? AND item_index = ?",
+        (job_id, item_index),
+    ).fetchone()
+
+
+# 终态条目状态：不再被 worker 处理
+_JOB_ITEM_TERMINAL_STATES = ("succeeded", "failed", "cancelled")
+
+
+def claim_next_job_item(
+    conn: sqlite3.Connection, run_token: str, now: str
+) -> Optional[Tuple[str, int, Any]]:
+    """领取下一个待处理条目：作业按 FIFO，作业内按下标顺序。
+
+    原子地把选中条目标记为 running（并记录 run_token），同时把其所属
+    queued 作业切换到 running。返回 (job_id, item_index, manifest)；
+    没有待处理条目时返回 None。调用方传入的 run_token 同时写入条目，
+    后续完成时需凭同一 token 才能提交，防止重启后旧执行者覆盖新执行者。
+    """
+    with transaction(conn):
+        row = conn.execute(
+            """
+            SELECT ji.job_id, ji.item_index, ji.manifest_json
+            FROM audit_job_items AS ji
+            JOIN audit_jobs AS j ON j.id = ji.job_id
+            WHERE ji.status = 'queued'
+              AND j.status IN ('queued', 'running')
+            ORDER BY j.created_at ASC, ji.item_index ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        updated = conn.execute(
+            "UPDATE audit_job_items SET status='running', run_token=?, started_at=? "
+            "WHERE job_id=? AND item_index=? AND status='queued'",
+            (run_token, now, row["job_id"], row["item_index"]),
+        )
+        if updated.rowcount == 0:  # 极端竞争下被他人抢先
+            return None
+        conn.execute(
+            "UPDATE audit_jobs SET status='running', started_at=COALESCE(started_at, ?) "
+            "WHERE id=? AND status IN ('queued', 'running')",
+            (now, row["job_id"]),
+        )
+        return row["job_id"], int(row["item_index"]), json.loads(row["manifest_json"])
+
+
+def complete_job_item_failure(
+    conn: sqlite3.Connection,
+    job_id: str,
+    item_index: int,
+    run_token: str,
+    error_code: str,
+    error_message: str,
+    error_details: Optional[List[Dict[str, Any]]],
+    now: str,
+) -> bool:
+    """把条目标记为失败（结构化错误），仅当 run_token 仍匹配。"""
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT status, run_token FROM audit_job_items WHERE job_id=? AND item_index=?",
+            (job_id, item_index),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["run_token"] != run_token:
+            return False
+        conn.execute(
+            "UPDATE audit_job_items SET status='failed', error_code=?, error_message=?, "
+            "error_details_json=?, finished_at=?, run_token=NULL "
+            "WHERE job_id=? AND item_index=?",
+            (
+                error_code,
+                error_message,
+                json.dumps(error_details, ensure_ascii=False) if error_details is not None else None,
+                now,
+                job_id,
+                item_index,
+            ),
+        )
+    return True
+
+
+def cancel_job_item(
+    conn: sqlite3.Connection, job_id: str, item_index: int, now: str
+) -> Optional[sqlite3.Row] | bool:
+    """取消尚未开始（queued）的条目。
+
+    返回取消后的条目行；条目不存在返回 None；已开始/已结束返回 ``False``
+    （调用方据此映射为 409）。
+    """
+    with transaction(conn):
+        row = conn.execute(
+            "SELECT * FROM audit_job_items WHERE job_id=? AND item_index=?",
+            (job_id, item_index),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["status"] != "queued":
+            return False  # type: ignore[return-value]
+        conn.execute(
+            "UPDATE audit_job_items SET status='cancelled', finished_at=? "
+            "WHERE job_id=? AND item_index=? AND status='queued'",
+            (now, job_id, item_index),
+        )
+    return get_audit_job_item(conn, job_id, item_index)
+
+
+def count_job_items(
+    conn: sqlite3.Connection, job_id: str
+) -> Dict[str, int]:
+    """按状态统计条目数，键覆盖全部六种状态。"""
+    counts = {state: 0 for state in ("queued", "running") + _JOB_ITEM_TERMINAL_STATES}
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS n FROM audit_job_items WHERE job_id=? GROUP BY status",
+        (job_id,),
+    ).fetchall()
+    for row in rows:
+        counts[row["status"]] = int(row["n"])
+    return counts
+
+
+def finalize_job_if_done(
+    conn: sqlite3.Connection, job_id: str, now: str
+) -> Optional[str]:
+    """作业的全部条目都到终态后，把作业切换到终态。
+
+    有 failed 条目 -> failed；否则 succeeded（全部 cancelled 也算完成）。
+    返回最终作业状态；尚未全部结束返回 None。
+    """
+    with transaction(conn):
+        job = conn.execute(
+            "SELECT status FROM audit_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        if job is None or job["status"] not in ("queued", "running"):
+            return job["status"] if job else None
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM audit_job_items "
+            "WHERE job_id=? AND status IN ('queued', 'running')",
+            (job_id,),
+        ).fetchone()[0]
+        if pending:
+            return None
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM audit_job_items WHERE job_id=? AND status='failed'",
+            (job_id,),
+        ).fetchone()[0]
+        final_status = "failed" if failed else "succeeded"
+        conn.execute(
+            "UPDATE audit_jobs SET status=?, finished_at=? WHERE id=?",
+            (final_status, now, job_id),
+        )
+        return final_status
+
+
+def recover_unfinished_jobs(conn: sqlite3.Connection, now: str) -> None:
+    """服务重启后的状态恢复：
+
+    * 上次崩溃时停在 running 的条目重置为 queued（run_token 作废），
+      旧 worker 线程即使残留也无法用过期 token 完成它；
+    * 全部条目都已到终态但作业仍处于 queued/running 的，补登终态；
+    * 其余未完成作业重新暴露给 worker，按 FIFO 继续执行。
+    """
+    with transaction(conn):
+        conn.execute(
+            "UPDATE audit_job_items SET status='queued', started_at=NULL, "
+            "finished_at=NULL, run_token=NULL WHERE status='running'"
+        )
+        rows = conn.execute(
+            "SELECT id FROM audit_jobs WHERE status IN ('queued', 'running')"
+        ).fetchall()
+        job_ids = [row["id"] for row in rows]
+    for job_id in job_ids:
+        finalize_job_if_done(conn, job_id, now)

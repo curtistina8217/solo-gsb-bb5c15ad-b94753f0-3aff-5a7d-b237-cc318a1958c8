@@ -7,6 +7,8 @@
 - **无解时不会只报第一个冲突**：遍历整棵搜索树，汇总所有本质不同的死路，
   对每条死路的约束集合做贪心极小化，返回**最小冲突链**以及链上**每一条约束的逐跳来源**；
 - 所有审计结果持久化到 SQLite，支持按 ID 查询、列表过滤；
+- 支持**异步审计作业**：一次提交单条或批量清单立即拿到 `job_id`，后台按序逐项求解落库，
+  可轮询作业状态/计数/逐项结果，可取消尚未开始的条目，服务重启后依据 SQLite 状态自动恢复；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -23,7 +25,9 @@ docker compose up --build
 | Swagger UI（可直接发请求） | <http://localhost:8000/docs> |
 | 健康检查 | <http://localhost:8000/health> |
 
-首次启动会自动建表并把 `data/seed_registry.json` 里的示例包注册表写入 SQLite 卷（仅当注册表为空时播种）。
+首次启动容器入口脚本会先执行 `python -m app.bootstrap`（自动建表；仅当注册表为空时播种
+`data/seed_registry.json`），再启动 uvicorn；该初始化幂等，可安全重复执行。
+若启动时存在未完成的异步作业，应用生命周期会依据 SQLite 状态自动恢复（见下文第 5 节）。
 
 本地直接运行（需要 Python 3.11）：
 
@@ -187,7 +191,106 @@ curl -s -X POST http://localhost:8000/api/v1/audits/batch \
 - 仅当整个批量请求**为空列表或超过 20 项**（或缺字段）时返回 `422`，此时不落任何记录；
   单项问题一律返回 `200` 并在该项的 `error` 中体现。
 
-### 5. 历史影响反查：某个包/版本被哪些审计依赖过
+### 5. 异步审计作业（提交即返回 job_id，后台逐项求解落库）
+
+清单较多或单项求解较慢时，使用异步作业避免长时间占用 HTTP 连接：
+`POST /api/v1/audit-jobs` 立即返回 `202` 与 `job_id`，后台**单 worker 按作业 FIFO、
+作业内按下标顺序**逐项求解并独立落库；单项校验/求解/落库失败**不会阻断其他项**。
+
+提交时请求体二选一：`manifest`（单条）或 `manifests`（1～20 条批量）。
+清单内容在提交时**不做逐项校验**——非法清单会在后台被记为该项的 `invalid_manifest`
+错误（与同步批量的逐项隔离语义一致）。
+
+```bash
+# 单条
+curl -s -X POST http://localhost:8000/api/v1/audit-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"manifest":{"dependencies":[{"name":"core-lib","range":"^1.0.0"}]}}' | jq
+
+# 批量
+curl -s -X POST http://localhost:8000/api/v1/audit-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"manifests":[
+    {"dependencies":[{"name":"core-lib","range":"^1.0.0"}]},
+    {"dependencies":[{"name":"cachekit","range":"^1.0.0"},{"name":"loggerkit","range":"^0.9.0"}]},
+    {"dependencies":[{"name":"x","range":"not-valid"}]}
+  ]}' | jq
+```
+
+立即返回（全部条目初始为 `queued`）：
+
+```json
+{
+  "job_id": "b26316ad-…",
+  "status": "queued",
+  "total": 3,
+  "created_at": "2026-09-23T02:00:00.000000+00:00",
+  "items": [
+    {"index": 0, "status": "queued", "audit_id": null, "audit": null, "error": null},
+    {"index": 1, "status": "queued", "audit_id": null, "audit": null, "error": null},
+    {"index": 2, "status": "queued", "audit_id": null, "audit": null, "error": null}
+  ]
+}
+```
+
+轮询作业详情：
+
+```bash
+curl -s http://localhost:8000/api/v1/audit-jobs/&lt;job_id&gt; | jq
+```
+
+```json
+{
+  "job_id": "b26316ad-…",
+  "status": "failed",
+  "total": 3,
+  "created_at": "2026-09-23T02:00:00.000000+00:00",
+  "started_at": "2026-09-23T02:00:00.100000+00:00",
+  "finished_at": "2026-09-23T02:00:00.500000+00:00",
+  "counts": {
+    "total": 3, "queued": 0, "running": 0,
+    "succeeded": 2, "failed": 1, "cancelled": 0
+  },
+  "items": [
+    {"index": 0, "status": "succeeded", "audit_id": "…", "audit": {"…与 GET /audits/{id} 同构…"}, "error": null},
+    {"index": 1, "status": "succeeded", "audit_id": "…", "audit": {"status": "infeasible", "conflicts": [ … ]}, "error": null},
+    {"index": 2, "status": "failed", "audit_id": null, "audit": null,
+     "error": {"code": "invalid_manifest", "message": "清单校验失败", "details": [ … ]}}
+  ]
+}
+```
+
+状态与计数：
+
+- **作业状态**：`queued`（尚未开始）→ `running`（有条目在处理）→
+  终态 `succeeded`（无失败条目；全部条目被取消也算 succeeded）或 `failed`（至少一条 failed）；
+- **条目状态**：`queued` / `running` / `succeeded` / `failed` / `cancelled`；
+- `counts` 给出六种状态的实时计数；成功条目携带独立 `audit_id`（可用 `GET /api/v1/audits/{id}`
+  取回，成功项与同步接口的落库行为完全等价），失败条目携带与批量接口一致的结构化 `error`
+  （`invalid_manifest` / `solver_error` / `internal_error`），失败项不产生审计记录。
+
+取消**尚未开始**的单个条目（标记为 `cancelled`，下标与计数保持稳定，不物理删除）：
+
+```bash
+curl -s -X DELETE http://localhost:8000/api/v1/audit-jobs/&lt;job_id&gt;/items/1 | jq '.status'
+# "cancelled"
+```
+
+- `running` / `succeeded` / `failed` / `cancelled` 的条目不能取消，返回 `409`；
+- 下标越界返回 `404`（错误信息会给出合法下标范围），作业不存在返回 `404`，负数下标返回 `422`；
+- 若取消使作业的全部条目都到终态（例如作业尚未开始时取消全部条目），作业立即收尾。
+
+**服务重启恢复**：作业与条目状态全部在 SQLite 中。启动时：
+
+1. 上次崩溃时停在 `running` 的条目重置为 `queued`（其执行令牌作废，旧执行者的迟到写入会被拒绝，
+   审计记录与条目标记在同一事务提交，因此不会产生重复/半成品记录）；
+2. 全部条目已到终态但作业仍未收尾的，补登作业终态；
+3. 其余 `queued` 作业由后台 worker 按 FIFO 继续执行。
+
+请求校验：同时提供 `manifest` 与 `manifests`、两者都缺、`manifests` 为空或超过 20 条，
+返回 `422`；作业 ID 不存在返回 `404`。
+
+### 6. 历史影响反查：某个包/版本被哪些审计依赖过
 
 扫描**已持久化**审计结果的 `resolution`、`sources` 与 `conflicts`，沿来源链找出
 直接或传递依赖该包（可选精确版本）的审计记录：
@@ -276,7 +379,7 @@ curl -s 'http://localhost:8000/api/v1/audits/impact/core-lib?version=2.0.0&statu
 - **未知包返回 `200` 空结果（`total=0`、`items=[]`），不返回 404**；
   非法 SemVer 版本参数返回 `422`。
 
-### 6. 导出可验证审计包并校验
+### 7. 导出可验证审计包并校验
 
 把**按创建时间排序**的 `audit_id` 列表（1～100 个、不可重复）交给导出接口，
 得到确定性的 JSONL 导出包：每条记录是规范化 JSON（键排序、紧凑、UTF-8），
@@ -376,6 +479,9 @@ def verify(gzip_base64):
 | `GET`  | `/health` | 健康检查（含数据库连通性与注册表包数量） |
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
 | `POST` | `/api/v1/audits/batch` | 批量审计 1～20 个清单：按序独立求解并分别落库，逐项返回 audit_id/status 或结构化 error（`200`；空列表或超过 20 项返回 `422`） |
+| `POST` | `/api/v1/audit-jobs` | 异步作业：提交单条 `manifest` 或 1～20 条 `manifests`，立即 `202` 返回 job_id，后台按序逐项求解落库 |
+| `GET`  | `/api/v1/audit-jobs/{job_id}` | 查询作业：queued/running/succeeded/failed 状态、六态完成计数与逐项结果 |
+| `DELETE` | `/api/v1/audit-jobs/{job_id}/items/{index}` | 取消作业中尚未开始（queued）的条目（`200`；已开始/已结束 `409`；越界/作业不存在 `404`） |
 | `GET`  | `/api/v1/audits` | 审计记录列表，支持 `status` / `limit` / `offset` |
 | `GET`  | `/api/v1/audits/{id}` | 查询单条审计的完整结果 |
 | `GET`  | `/api/v1/audits/impact/{package_name}` | 历史影响反查：扫描 resolution/sources/conflicts，找直接或传递依赖该包/版本的审计（可选 `version` / `status` / `limit`），未知包返回空结果而非 404 |
@@ -432,6 +538,8 @@ pytest -q
 测试覆盖 SemVer 解析（含预发布排序与 npm 范围语义）、求解器
 （可行/无解/深层传递/多冲突枚举/预算保护）、全部 HTTP 接口（临时 SQLite，互不污染）、
 批量审计（混合结果逐项隔离与计数、空/超限 422、求解与持久化异常隔离、成功项分别落库）、
+异步审计作业（单条/批量提交立即返回、逐项隔离与计数、非法清单单项失败、queued 条目取消与
+409/404/422 语义、全部取消即收尾、处理中/未开始两类作业的重启恢复与防重复落库）、
 历史影响反查（resolution/冲突约束/来源链命中、层级与稳定排序、版本聚合、未知包空结果），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
@@ -439,10 +547,12 @@ pytest -q
 
 ```
 app/
-  main.py       # FastAPI 路由与生命周期
+  main.py       # FastAPI 路由与生命周期（含异步作业路由与 worker 启停）
+  jobs.py       # 异步作业后台 worker：FIFO 逐项求解/落库、失败隔离、重启令牌
+  bootstrap.py  # 启动初始化：建表 + 首次播种（python -m app.bootstrap，幂等）
   solver.py     # 回溯求解器、冲突极小化与来源链
   semver.py     # SemVer 2.0.0 与版本范围解析
-  database.py   # SQLite 建表/注册表/审计记录
+  database.py   # SQLite 建表/注册表/审计记录/异步作业表与状态流转
   models.py     # Pydantic 请求/响应模型
   impact.py     # 历史影响反查：resolution/sources/conflicts 扫描与层级计算
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
@@ -450,6 +560,7 @@ data/
   seed_registry.json   # 示例注册表
 tests/                  # pytest 测试套件
 Dockerfile
+docker-entrypoint.sh   # 容器入口：先 bootstrap 初始化数据库，再启动 uvicorn
 docker-compose.yml
 ```
 
@@ -459,3 +570,4 @@ docker-compose.yml
 | --- | --- | --- |
 | `AUDIT_DB_PATH` | 容器内 `/data/audits.db`，本地 `./data/audits.db` | SQLite 数据库路径 |
 | `AUDIT_SEED_PATH` | 容器内 `/app/data/seed_registry.json` | 首次启动的示例注册表 |
+| `AUDIT_JOB_STOP_TIMEOUT` | `10`（秒） | 服务停机时等待后台 worker 完成当前条目的最长时间 |

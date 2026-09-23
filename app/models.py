@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .semver import Version, VersionError, VersionRange
 
@@ -214,6 +214,94 @@ class BatchAuditResponse(BaseModel):
 
 
 # ---------- 历史影响反查 ----------
+
+
+# ---------- 异步审计作业 ----------
+
+
+class AuditJobIn(BaseModel):
+    """异步作业请求：单条清单（manifest）或批量清单（manifests，1～20 条）二选一。
+
+    清单内容不在提交时校验：非法清单在后台逐项求解时记为该项的 invalid_manifest
+    错误，与同步批量接口的逐项隔离语义一致。
+    """
+
+    manifest: Optional[Any] = Field(
+        None, description="单条清单，格式与 POST /api/v1/audits 请求体一致"
+    )
+    manifests: Optional[List[Any]] = Field(
+        None,
+        max_length=20,
+        description="批量清单（1～20 条），元素格式与 POST /api/v1/audits 请求体一致",
+    )
+
+    @model_validator(mode="after")
+    def _check_exactly_one(self) -> "AuditJobIn":
+        if self.manifest is None and self.manifests is None:
+            raise ValueError("必须提供 manifest（单条）或 manifests（批量）之一")
+        if self.manifest is not None and self.manifests is not None:
+            raise ValueError("manifest 与 manifests 只能二选一，不能同时提供")
+        if self.manifests is not None and len(self.manifests) == 0:
+            raise ValueError("manifests 至少需要 1 条清单")
+        return self
+
+    def raw_manifests(self) -> List[Any]:
+        """返回统一形态的原始清单列表（保留原始类型，交由 worker 逐项校验）。"""
+        return [self.manifest] if self.manifest is not None else list(self.manifests or [])
+
+
+class AuditJobItemError(BaseModel):
+    """异步作业单项失败时的结构化错误（与同步批量错误码一致）。"""
+
+    code: Literal["invalid_manifest", "solver_error", "internal_error"]
+    message: str
+    details: Optional[List[Dict[str, Any]]] = None
+
+
+class AuditJobItemOut(BaseModel):
+    """作业中的逐项状态与结果。"""
+
+    index: int = Field(..., description="该项在提交清单中的下标（0 起）")
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+    audit_id: Optional[str] = Field(None, description="成功落库的审计记录 ID")
+    audit: Optional[AuditResponse] = Field(
+        None, description="完整审计结果（与 GET /api/v1/audits/{id} 同构）；仅成功时存在"
+    )
+    error: Optional[AuditJobItemError] = Field(None, description="结构化错误；仅失败时存在")
+
+
+class AuditJobCreatedResponse(BaseModel):
+    """POST /api/v1/audit-jobs 的即时响应。"""
+
+    job_id: str
+    status: Literal["queued", "running"]
+    total: int = Field(..., description="作业包含的条目总数（1～20）")
+    created_at: str
+    items: List[AuditJobItemOut] = Field(
+        ..., description="提交时全部条目均为 queued 的逐项视图"
+    )
+
+
+class AuditJobCounts(BaseModel):
+    total: int
+    queued: int
+    running: int
+    succeeded: int
+    failed: int
+    cancelled: int = Field(..., description="被 DELETE 取消的条目数")
+
+
+class AuditJobResponse(BaseModel):
+    """GET /api/v1/audit-jobs/{job_id} 的作业详情。"""
+
+    job_id: str
+    status: Literal["queued", "running", "succeeded", "failed"]
+    total: int
+    created_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    counts: AuditJobCounts
+    items: List[AuditJobItemOut]
 
 
 # ---------- 历史影响反查 ----------

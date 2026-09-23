@@ -8,7 +8,6 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 from contextlib import asynccontextmanager
@@ -19,22 +18,37 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from . import __version__
+from .bootstrap import initialize_database
 from .bundle import build_bundle, decode_bundle_base64, verify_bundle
 from .database import (
     DEFAULT_DB_PATH,
+    cancel_job_item,
     connect,
     count_audits,
+    count_job_items,
+    finalize_job_if_done,
     get_audit,
-    init_db,
+    get_audit_job,
+    get_audit_job_item,
     insert_audit,
+    insert_audit_job,
     iter_audits,
+    list_audit_job_items,
     list_audits,
     load_registry,
     package_count,
     upsert_package,
+    utcnow_iso,
 )
 from .impact import build_impact
+from .jobs import JobRunner
 from .models import (
+    AuditJobCounts,
+    AuditJobCreatedResponse,
+    AuditJobIn,
+    AuditJobItemError,
+    AuditJobItemOut,
+    AuditJobResponse,
     AuditResponse,
     AuditSummary,
     BatchAuditError,
@@ -58,25 +72,25 @@ logger = logging.getLogger(__name__)
 SEED_PATH = os.environ.get("AUDIT_SEED_PATH", "/app/data/seed_registry.json")
 MAX_LIMIT = 100
 BATCH_MAX_ITEMS = 20
+# 测试可通过该变量缩短停机等待（等待正在处理的条目结束）；生产默认 10s
+JOB_STOP_TIMEOUT = float(os.environ.get("AUDIT_JOB_STOP_TIMEOUT", "10"))
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    conn = connect()
-    init_db(conn)
-    # 仅在注册表为空时播种，避免覆盖用户通过 API 写入的数据
-    if package_count(conn) == 0:
-        seed_file = Path(SEED_PATH)
-        if seed_file.is_file():
-            seed = json.loads(seed_file.read_text(encoding="utf-8"))
-            for name, payload in seed.items():
-                upsert_package(conn, name, payload["versions"])
-    conn.close()
+    # 建表 + 首次启动播种（幂等；容器场景也可由 entrypoint 提前执行）
+    initialize_database(seed_path=SEED_PATH, db_path=DEFAULT_DB_PATH)
     # 常驻连接（WAL 模式，FastAPI 同步路由）
     app.state.conn = connect(DEFAULT_DB_PATH)
+    # 重启恢复未完成作业，随后启动后台 worker
+    runner = JobRunner(db_path=DEFAULT_DB_PATH, stop_timeout=JOB_STOP_TIMEOUT)
+    runner.recover()
+    runner.start()
+    app.state.job_runner = runner
     try:
         yield
     finally:
+        runner.stop()
         app.state.conn.close()
 
 
@@ -115,6 +129,9 @@ def index() -> dict:
             "GET /api/v1/audits/impact/{package_name}",
             "POST /api/v1/audits/export-bundle",
             "POST /api/v1/audits/verify-bundle",
+            "POST /api/v1/audit-jobs",
+            "GET /api/v1/audit-jobs/{job_id}",
+            "DELETE /api/v1/audit-jobs/{job_id}/items/{item_index}",
             "PUT /api/v1/registry/packages/{name}",
             "GET /api/v1/registry/packages",
         ],
@@ -344,6 +361,135 @@ def create_audits_batch(payload: BatchAuditIn, request: Request) -> BatchAuditRe
         error=counts["error"],
         items=items,
     )
+
+
+# ---------- 异步审计作业 ----------
+
+
+def _job_item_out(conn: sqlite3.Connection, row: sqlite3.Row) -> AuditJobItemOut:
+    """把一行 audit_job_items 组装成对外的逐项视图。"""
+    audit = None
+    if row["status"] == "succeeded":
+        result_json = row["result_json"]
+        if result_json:
+            audit = AuditResponse(**json.loads(result_json))
+        elif row["audit_id"]:
+            # 兼容直接从审计表取回（正常路径下 result_json 已内联）
+            record = get_audit(conn, row["audit_id"])
+            if record is not None:
+                audit = AuditResponse(**json.loads(record["result_json"]))
+    error = None
+    if row["status"] == "failed":
+        details = None
+        if row["error_details_json"]:
+            details = json.loads(row["error_details_json"])
+        error = AuditJobItemError(
+            code=row["error_code"], message=row["error_message"], details=details
+        )
+    return AuditJobItemOut(
+        index=row["item_index"],
+        status=row["status"],
+        audit_id=row["audit_id"],
+        audit=audit,
+        error=error,
+    )
+
+
+def _build_job_response(conn: sqlite3.Connection, job: sqlite3.Row) -> AuditJobResponse:
+    item_rows = list_audit_job_items(conn, job["id"])
+    items = [_job_item_out(conn, row) for row in item_rows]
+    counts = count_job_items(conn, job["id"])
+    return AuditJobResponse(
+        job_id=job["id"],
+        status=job["status"],
+        total=job["total"],
+        created_at=job["created_at"],
+        started_at=job["started_at"],
+        finished_at=job["finished_at"],
+        counts=AuditJobCounts(**counts, total=job["total"]),
+        items=items,
+    )
+
+
+@app.post(
+    "/api/v1/audit-jobs",
+    response_model=AuditJobCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["audit-jobs"],
+    summary="异步审计：提交单条或 1～20 条清单，立即返回 job_id，后台按序逐项求解落库",
+)
+def create_audit_job(payload: AuditJobIn, request: Request) -> AuditJobCreatedResponse:
+    """清单内容在提交时**不做逐项校验**：非法清单在后台记为该项 ``invalid_manifest``，
+    单项失败不阻断其他项。请求体二选一：``manifest``（单条）或 ``manifests``（批量）。
+    """
+    manifests = payload.raw_manifests()
+    job_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    conn = get_conn(request)
+    insert_audit_job(conn, job_id=job_id, created_at=created_at, manifests=manifests)
+    request.app.state.job_runner.notify()
+
+    items = [
+        AuditJobItemOut(index=index, status="queued")
+        for index in range(len(manifests))
+    ]
+    return AuditJobCreatedResponse(
+        job_id=job_id, status="queued", total=len(manifests),
+        created_at=created_at, items=items,
+    )
+
+
+@app.get(
+    "/api/v1/audit-jobs/{job_id}",
+    response_model=AuditJobResponse,
+    tags=["audit-jobs"],
+    summary="查询异步作业：整体状态、完成计数与逐项结果",
+)
+def get_audit_job_detail(job_id: str, request: Request) -> AuditJobResponse:
+    conn = get_conn(request)
+    job = get_audit_job(conn, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"审计作业不存在: {job_id}")
+    return _build_job_response(conn, job)
+
+
+@app.delete(
+    "/api/v1/audit-jobs/{job_id}/items/{item_index}",
+    response_model=AuditJobItemOut,
+    tags=["audit-jobs"],
+    summary="取消作业中尚未开始（queued）的单个条目",
+)
+def cancel_audit_job_item(
+    job_id: str, item_index: int, request: Request
+) -> AuditJobItemOut:
+    """仅 queued 条目可取消；running/succeeded/failed/cancelled 返回 409。
+
+    取消是“标记为 cancelled”而非物理删除，下标与计数保持稳定。
+    """
+    if item_index < 0:
+        raise HTTPException(status_code=422, detail="item_index 不能为负数")
+    conn = get_conn(request)
+    job = get_audit_job(conn, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"审计作业不存在: {job_id}")
+
+    updated = cancel_job_item(conn, job_id, item_index, utcnow_iso())
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"条目不存在: 作业 {job_id} 下标 {item_index}（合法下标 0～{job['total'] - 1}）",
+        )
+    if updated is False:
+        row = get_audit_job_item(conn, job_id, item_index)
+        raise HTTPException(
+            status_code=409,
+            detail=f"条目已开始或已结束，无法取消（当前状态: {row['status']}）",
+        )
+
+    # 取消可能恰好使整个作业收尾（例如 queued 作业的全部条目被取消）
+    finalize_job_if_done(conn, job_id, utcnow_iso())
+    request.app.state.job_runner.notify()
+    return _job_item_out(conn, updated)
 
 
 @app.get("/api/v1/audits", response_model=dict, tags=["audits"])
